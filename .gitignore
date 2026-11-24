@@ -1,0 +1,17 @@
+# Сборка
+build/
+.gradle/
+.kotlin/
+local.properties
+*.apk
+*.aab
+
+# Ключи подписи — никогда не в репозиторий
+*.keystore
+*.jks
+keystore.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
