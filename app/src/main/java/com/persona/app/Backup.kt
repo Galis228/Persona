@@ -113,24 +113,49 @@ object Updates {
         if (Build.VERSION.SDK_INT >= 28) pi.longVersionCode else @Suppress("DEPRECATION") pi.versionCode.toLong()
     }.getOrDefault(0)
 
+    private fun get(url: String): Pair<Int, String?> {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.setRequestProperty("Accept", "application/vnd.github+json"); c.connectTimeout = 15_000; c.readTimeout = 20_000
+        c.useCaches = false
+        return try { c.responseCode to if (c.responseCode in 200..299) c.inputStream.bufferedReader().readText() else null } finally { c.disconnect() }
+    }
+
+    /** Кандидат на обновление из одного источника. */
+    private data class Found(val version: String, val apk: String?, val notes: String?, val page: String?)
+
+    /** Ветка updates: update.json + APK рядом. Её публикует сборка без доступа к релизам. */
+    private fun fromBranch(r: String): Found? {
+        val base = "https://raw.githubusercontent.com/$r/updates/"
+        val (code, body) = get(base + "update.json?t=${System.currentTimeMillis() / 60000}")
+        if (code != 200 || body == null) return null
+        val o = json.parseToJsonElement(body).jsonObject
+        val v = (o["versionName"] as? JsonPrimitive)?.content ?: return null
+        val apk = (o["apk"] as? JsonPrimitive)?.content?.let { if (it.startsWith("http")) it else base + it }
+        return Found(v.trimStart('v', 'V'), apk, (o["notes"] as? JsonPrimitive)?.content, "https://github.com/$r/tree/updates")
+    }
+
+    /** Обычный релиз GitHub с приложенным APK. */
+    private fun fromRelease(r: String): Found? {
+        val (code, body) = get("https://api.github.com/repos/$r/releases/latest")
+        if (code != 200 || body == null) return null
+        val o = json.parseToJsonElement(body).jsonObject
+        val tag = (o["tag_name"] as? JsonPrimitive)?.content ?: return null
+        val apk = (o["assets"] as? JsonArray)?.mapNotNull { it as? JsonObject }?.firstOrNull { (it["name"] as? JsonPrimitive)?.content?.endsWith(".apk") == true }
+            ?.let { (it["browser_download_url"] as? JsonPrimitive)?.content }
+        return Found(tag.trimStart('v', 'V'), apk, (o["body"] as? JsonPrimitive)?.content, (o["html_url"] as? JsonPrimitive)?.content)
+    }
+
     suspend fun check(ctx: Context): Result<UpdateInfo> = withContext(Dispatchers.IO) {
         val repo = ctx.app.repo
         val r = repo.settings.value.updates.repo.trim().removePrefix("https://github.com/").trim('/')
         runCatching {
             if (!Regex("^[\\w.-]+/[\\w.-]+$").matches(r)) throw IllegalArgumentException("Укажи репозиторий в виде «владелец/название»")
-            val c = URL("https://api.github.com/repos/$r/releases/latest").openConnection() as HttpURLConnection
-            c.setRequestProperty("Accept", "application/vnd.github+json"); c.connectTimeout = 15_000; c.readTimeout = 20_000
-            try {
-                if (c.responseCode == 404) throw IllegalStateException("В репозитории $r нет релизов")
-                if (c.responseCode !in 200..299) throw IllegalStateException("GitHub ответил ${c.responseCode}")
-                val o = json.parseToJsonElement(c.inputStream.bufferedReader().readText()).jsonObject
-                val tag = (o["tag_name"] as? JsonPrimitive)?.content ?: error("Нет версии в релизе")
-                val apk = (o["assets"] as? JsonArray)?.mapNotNull { it as? JsonObject }?.firstOrNull { (it["name"] as? JsonPrimitive)?.content?.endsWith(".apk") == true }
-                    ?.let { (it["browser_download_url"] as? JsonPrimitive)?.content }
-                val page = (o["html_url"] as? JsonPrimitive)?.content
-                repo.settings.value.updates.copy(repo = r, lastCheck = System.currentTimeMillis(), latest = tag.trimStart('v', 'V'), url = apk,
-                    notes = (o["body"] as? JsonPrimitive)?.content?.take(800), page = page)
-            } finally { c.disconnect() }
+            val found = listOfNotNull(runCatching { fromBranch(r) }.getOrNull(), runCatching { fromRelease(r) }.getOrNull())
+                .filter { it.apk != null }
+                .maxWithOrNull { a, b -> compare(a.version, b.version) }
+                ?: throw IllegalStateException("В репозитории $r пока нет опубликованных версий")
+            repo.settings.value.updates.copy(repo = r, lastCheck = System.currentTimeMillis(), latest = found.version, url = found.apk,
+                notes = found.notes?.take(800), page = found.page)
         }.onSuccess { info -> repo.settings { it.copy(updates = info) } }
     }
 }

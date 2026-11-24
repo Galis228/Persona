@@ -1100,7 +1100,7 @@ private fun UpdatesPage() {
                 }
             })
             u.page?.let { pg -> HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.outlineVariant)
-                NavRow("Страница релиза на GitHub", u.repo, { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(pg))) }) }
+                NavRow("Открыть на GitHub", u.repo, { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(pg))) }) }
         }
     }
     status?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
