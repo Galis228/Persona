@@ -137,6 +137,55 @@ object KnownModels {
     }
 }
 
+/** Модели для картинок и цена одной картинки 1024×1024 по качеству. Цены примерные. */
+object ImageModels {
+    data class Img(val id: String, val title: String, val low: Double, val medium: Double, val high: Double, val note: String = "") {
+        val flat get() = low == medium && medium == high
+        fun price(q: ImageQuality) = when (q) { ImageQuality.LOW -> low; ImageQuality.MEDIUM -> medium; ImageQuality.HIGH -> high }
+    }
+
+    val list = listOf(
+        Img("gpt-image-2", "GPT Image 2", 0.006, 0.053, 0.211, "Лучшая цена за качество"),
+        Img("gpt-image-1-mini", "GPT Image 1 mini", 0.005, 0.011, 0.036, "OpenAI отключит её 1 декабря 2026"),
+        Img("gpt-image-1", "GPT Image 1", 0.011, 0.042, 0.167, "Устарела — лучше GPT Image 2"),
+        Img("dall-e-3", "DALL·E 3", 0.04, 0.04, 0.08, "Устарела"),
+        Img("gemini-2.5-flash-image", "Gemini Flash Image", 0.039, 0.039, 0.039, "Nano Banana: одно качество, хорошо рисует людей"),
+        Img("gemini-3-pro-image", "Gemini 3 Pro Image", 0.134, 0.134, 0.134, "Очень детально, но дорого"),
+    )
+
+    private fun bare(m: String) = m.substringAfterLast('/').lowercase().replace('.', '-').removeSuffix("-preview")
+
+    fun info(model: String): Img? {
+        val b = bare(model)
+        return list.filter { val id = it.id.replace('.', '-'); b == id || b.startsWith("$id-") }.maxByOrNull { it.id.length }
+    }
+
+    fun hasQuality(model: String) = bare(model).let { it.startsWith("gpt-image") || it.startsWith("dall-e-3") }
+
+    fun canDraw(p: Provider) = p != Provider.CLAUDE && p != Provider.DEEPSEEK
+
+    /** Модель по умолчанию, если пользователь ничего не выбрал. */
+    fun default(p: Provider): String? = when (p) {
+        Provider.OPENAI -> "gpt-image-2"
+        Provider.GEMINI -> "gemini-2.5-flash-image"
+        Provider.OPENROUTER -> "google/gemini-2.5-flash-image"
+        else -> null
+    }
+
+    fun effective(s: Settings): String? = s.imageModel.ifBlank { default(s.provider) ?: "" }.ifBlank { null }
+
+    fun featured(p: Provider): List<String> = when (p) {
+        Provider.OPENAI -> listOf("gpt-image-2", "gpt-image-1-mini")
+        Provider.GEMINI -> listOf("gemini-2.5-flash-image", "gemini-3-pro-image-preview")
+        Provider.OPENROUTER -> listOf("google/gemini-2.5-flash-image", "google/gemini-3-pro-image-preview")
+        else -> emptyList()
+    }
+
+    fun price(model: String, q: ImageQuality): Double? = info(model)?.price(if (hasQuality(model)) q else ImageQuality.LOW)
+
+    fun title(model: String) = info(model)?.title ?: model.substringAfterLast('/')
+}
+
 /** Сама выбирает хорошую модель для ролплея и понимает названия «как попало» («4o mini», «gpt 4o-mini»). */
 object ModelPick {
     private val junk = listOf("embed", "tts", "audio", "realtime", "transcribe", "image", "vision-preview", "search", "moderation", "whisper", "dall-e", "imagen", "live", "guard", "instruct-beta", "codex", "babbage", "davinci", "computer-use", "deep-research", "veo", "aqa", "learnlm")

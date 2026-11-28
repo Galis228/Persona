@@ -63,3 +63,16 @@ class V054Test {
         assertNotNull(h1.first().text.takeIf { it.contains("номер 10") })
     }
 }
+
+class ImageTest {
+    @Test fun imagePrices() {
+        org.junit.Assert.assertEquals(0.006, ImageModels.price("gpt-image-2", ImageQuality.LOW)!!, 1e-9)
+        org.junit.Assert.assertEquals(0.211, ImageModels.price("gpt-image-2", ImageQuality.HIGH)!!, 1e-9)
+        // У Gemini одна цена при любом качестве
+        org.junit.Assert.assertEquals(0.039, ImageModels.price("google/gemini-2.5-flash-image", ImageQuality.HIGH)!!, 1e-9)
+        org.junit.Assert.assertTrue(ImageModels.hasQuality("gpt-image-2"))
+        org.junit.Assert.assertFalse(ImageModels.hasQuality("gemini-2.5-flash-image"))
+        org.junit.Assert.assertEquals("gpt-image-2", ImageModels.effective(Settings(provider = Provider.OPENAI)))
+        org.junit.Assert.assertEquals("Gemini 3 Pro Image", ImageModels.title("gemini-3-pro-image-preview"))
+    }
+}

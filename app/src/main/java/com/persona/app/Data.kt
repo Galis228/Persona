@@ -190,6 +190,13 @@ data class Price(val inPerM: Double = 0.0, val outPerM: Double = 0.0, val cached
 data class UsageDay(val date: String, val model: String, val inTok: Long = 0, val outTok: Long = 0, val cost: Double = 0.0, val costKnown: Boolean = false, val requests: Int = 0, val cachedTok: Long = 0)
 
 @Serializable enum class Mode { AUTO, LOCAL, API }
+
+/** Качество картинок (для моделей OpenAI, где от него зависит цена). */
+@Serializable enum class ImageQuality(val title: String, val api: String, val hint: String) {
+    LOW("Эскиз", "low", "Быстро и дёшево, детали попроще — для картинок по ходу сюжета"),
+    MEDIUM("Обычное", "medium", "Хорошие детали и лица — для важных сцен"),
+    HIGH("Детальное", "high", "Максимум деталей — для обложек и аватарок"),
+}
 @Serializable enum class Preset(val title: String, val temp: Float, val topP: Float, val rep: Float) {
     // Штраф за повторы мягкий: в русском у слова много форм с общим началом, сильный штраф ломает окончания
     STRICT("Строгий", 0.6f, 0.9f, 1.0f),
@@ -258,6 +265,7 @@ data class Settings(
     val downloads: Map<String, Long> = emptyMap(),
     val notifyAsked: Boolean = false,
     val imageModel: String = "",
+    val imageQuality: ImageQuality = ImageQuality.LOW,
     val lockEnabled: Boolean = false,
     val look: Appearance = Appearance(),
     val autoBackup: AutoBackupCfg = AutoBackupCfg(),

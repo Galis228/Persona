@@ -415,29 +415,74 @@ private fun ModelRow(m: String, selected: Boolean, s: Settings, onClick: () -> U
     }
 }
 
-/** Модель для «Нарисовать сцену». */
+/** Модель и качество для «Нарисовать сцену» — с ценой и подсчётом, на сколько хватит. */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ImageModelBox(s: Settings, models: List<String>) {
     val repo = LocalContext.current.app.repo
     CardBox {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Кнопка «Нарисовать сцену» в чате превращает текущий момент в иллюстрацию тем же ключом.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (s.provider == Provider.CLAUDE || s.provider == Provider.DEEPSEEK) Text("${s.provider.title} не рисует картинки — для них нужен другой сервис.", style = MaterialTheme.typography.bodySmall, color = Amber)
-            else {
-                OutlinedTextField(s.imageModel, { v -> repo.settings { it.copy(imageModel = v.trim()) } }, Modifier.fillMaxWidth(), singleLine = true, shape = RoundedCornerShape(14.dp),
-                    label = { Text("Модель для картинок") }, placeholder = { Text(when (s.provider) {
-                        Provider.OPENROUTER -> "например, google/gemini-2.5-flash-image"
-                        Provider.OPENAI -> "например, gpt-image-1"
-                        Provider.GEMINI -> "например, imagen-4.0-generate-001"
-                        else -> "название модели"
-                    }) })
-                val img = models.filter { m -> listOf("image", "imagen", "dall-e", "flux", "diffusion").any { m.contains(it, true) } }.take(8)
-                if (img.isNotEmpty()) FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    img.forEach { m -> FilterChip(s.imageModel == m, { repo.settings { it.copy(imageModel = m) } }, { Text(m.substringAfterLast('/'), maxLines = 1) }) }
+            if (!ImageModels.canDraw(s.provider)) {
+                Text("${s.provider.title} не рисует картинки — для них нужен OpenAI, Gemini или OpenRouter.", style = MaterialTheme.typography.bodySmall, color = Amber)
+                return@Column
+            }
+            val model = ImageModels.effective(s).orEmpty()
+            // Модель
+            Text("Модель", fontWeight = FontWeight.SemiBold)
+            val extra = models.filter { m -> listOf("image", "imagen", "dall-e", "flux", "diffusion").any { m.contains(it, true) } && !m.contains("imagen") }
+            val chips = (ImageModels.featured(s.provider) + extra).distinctBy { ImageModels.info(it)?.id ?: it }.take(8)
+            if (chips.isNotEmpty()) FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                chips.forEach { m -> FilterChip(model == m, { repo.settings { it.copy(imageModel = m) } }, { Text(ImageModels.title(m), maxLines = 1) }) }
+            }
+            ImageModels.info(model)?.note?.takeIf { it.isNotBlank() }?.let { n ->
+                Text(n, style = MaterialTheme.typography.bodySmall, color = if (n.contains("отключит") || n.contains("Устарела")) Amber else MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            OutlinedTextField(s.imageModel, { v -> repo.settings { it.copy(imageModel = v.trim()) } }, Modifier.fillMaxWidth(), singleLine = true, shape = RoundedCornerShape(14.dp),
+                label = { Text("Своя модель") }, placeholder = { Text(ImageModels.default(s.provider) ?: "название модели") },
+                supportingText = { Text("Пусто — значит ${ImageModels.default(s.provider)?.let { ImageModels.title(it) } ?: "модель не выбрана"}") })
+
+            // Качество
+            val q = ImageModels.hasQuality(model)
+            Text("Качество", fontWeight = FontWeight.SemiBold)
+            if (q) {
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                    ImageQuality.entries.forEachIndexed { i, iq ->
+                        SegmentedButton(s.imageQuality == iq, { repo.settings { it.copy(imageQuality = iq) } }, SegmentedButtonDefaults.itemShape(i, ImageQuality.entries.size)) {
+                            Text(iq.title, maxLines = 1)
+                        }
+                    }
                 }
-                Text("Картинки обычно платные: проверь цену модели у провайдера.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(s.imageQuality.hint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else Text("У ${ImageModels.title(model)} одно качество — переключать нечего.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+            // Сколько хватит
+            val info = ImageModels.info(model)
+            if (info == null) Text("Цену этой модели я не знаю — посмотри её у провайдера.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            else Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Сколько хватит на \$10", fontWeight = FontWeight.Bold)
+                    val rows = if (q) ImageQuality.entries.toList() else listOf(ImageQuality.LOW)
+                    rows.forEach { iq ->
+                        val price = info.price(iq)
+                        val mine = !q || iq == s.imageQuality
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(if (q) iq.title else "Картинка", Modifier.weight(1f), fontWeight = if (mine) FontWeight.Bold else FontWeight.Normal)
+                            Text(KnownModels.money(price), Modifier.width(72.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("≈${(10 / price).toInt()} шт.", fontWeight = if (mine) FontWeight.Bold else FontWeight.Normal, color = if (mine) Accent else MaterialTheme.colorScheme.onSurface)
+                        }
+                    }
+                    val img = info.price(if (q) s.imageQuality else ImageQuality.LOW)
+                    val reply = KnownModels.price(s.apiModel)?.let { KnownModels.perReply(it, s) }?.takeIf { it > 0 }
+                    HorizontalDivider()
+                    if (reply != null) {
+                        Text("1 картинка стоит как ≈${(img / reply).toInt().coerceAtLeast(1)} ответов ${KnownModels.title(s.apiModel)}.", style = MaterialTheme.typography.bodySmall)
+                        val left = 10 - img * 50
+                        if (left > 0) Text("Например, \$10 = 50 картинок + ${KnownModels.repliesLabel(left / reply)} ответов в чате.", style = MaterialTheme.typography.bodySmall)
+                    } else if (s.apiModel.endsWith(":free")) Text("Чат на бесплатной модели — деньги уходят только на картинки.", style = MaterialTheme.typography.bodySmall)
+                    Text("Плюс доля цента на описание сцены для художника. Цены примерные, для картинки 1024×1024.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
     }

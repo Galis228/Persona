@@ -437,23 +437,38 @@ class ApiEngine(private val repo: Repo? = null) {
     suspend fun generateImage(s: Settings, prompt: String): ByteArray = withContext(Dispatchers.IO) {
         val key = key(s)
         if (key.isBlank()) throw EngineException("Для картинок нужен API-ключ: «Настройки → Через интернет».")
-        if (s.provider == Provider.CLAUDE) throw EngineException("Claude не рисует картинки. Выбери OpenRouter, OpenAI или Gemini.")
-        if (s.imageModel.isBlank()) throw EngineException("Не указана модель для картинок: «Настройки → Через интернет → Картинки».")
+        if (!ImageModels.canDraw(s.provider)) throw EngineException("${s.provider.title} не рисует картинки. Выбери OpenRouter, OpenAI или Gemini.")
+        val model = ImageModels.effective(s) ?: throw EngineException("Не указана модель для картинок: «Настройки → Через интернет → Картинки».")
+        val bytes = when {
+            s.provider == Provider.GEMINI && !model.startsWith("imagen") -> geminiImage(model, key, prompt)
+            else -> openAiImage(s, model, key, prompt)
+        }
+        // Картинка попадает в «Расходы API»: по известной цене
+        runCatching { repo?.addUsage(model, 0, 0, ImageModels.price(model, s.imageQuality)) }
+        bytes
+    }
+
+    private fun openAiImage(s: Settings, model: String, key: String, prompt: String): ByteArray {
         val openrouter = s.provider == Provider.OPENROUTER
+        val gptImage = model.substringAfterLast('/').startsWith("gpt-image")
         val body = if (openrouter) buildJsonObject {
-            put("model", s.imageModel)
+            put("model", model)
             put("messages", buildJsonArray { add(buildJsonObject { put("role", "user"); put("content", prompt) }) })
             put("modalities", buildJsonArray { add(JsonPrimitive("image")); add(JsonPrimitive("text")) })
         } else buildJsonObject {
-            put("model", s.imageModel); put("prompt", prompt); put("n", 1)
-            if (s.imageModel.startsWith("dall-e") || s.provider == Provider.GEMINI) put("response_format", "b64_json")
+            put("model", model); put("prompt", prompt); put("n", 1)
+            when {
+                gptImage -> { put("quality", s.imageQuality.api); put("size", "1024x1024") }
+                model.startsWith("dall-e-3") -> { put("quality", if (s.imageQuality == ImageQuality.HIGH) "hd" else "standard"); put("response_format", "b64_json") }
+                model.startsWith("dall-e") || s.provider == Provider.GEMINI -> put("response_format", "b64_json")
+            }
         }
         val c = open(s.apiBase + if (openrouter) "/chat/completions" else "/images/generations", s, key)
         c.readTimeout = 180_000
         try {
             c.doOutput = true
             c.outputStream.use { it.write(body.toString().toByteArray()) }
-            if (c.responseCode !in 200..299) throw failure(c, s)
+            if (c.responseCode !in 200..299) throw failure(c, s.copy(apiModel = model))
             val o = json.parseToJsonElement(c.inputStream.bufferedReader().readText()).jsonObject
             val url: String? = if (openrouter) {
                 val msg = ((o["choices"] as? JsonArray)?.firstOrNull() as? JsonObject)?.get("message") as? JsonObject
@@ -464,11 +479,34 @@ class ApiEngine(private val repo: Repo? = null) {
                 val d = (o["data"] as? JsonArray)?.firstOrNull() as? JsonObject
                 (d?.get("b64_json") as? JsonPrimitive)?.content?.let { "data:image/png;base64,$it" } ?: (d?.get("url") as? JsonPrimitive)?.content
             }
-            when {
-                url == null -> throw EngineException("Модель не вернула картинку. Проверь, что «${s.imageModel}» умеет рисовать.")
+            return when {
+                url == null -> throw EngineException("Модель не вернула картинку. Проверь, что «$model» умеет рисовать.")
                 url.startsWith("data:") -> Base64.decode(url.substringAfter(","), Base64.DEFAULT)
                 else -> URL(url).openStream().use { it.readBytes() }
             }
+        } finally { c.disconnect() }
+    }
+
+    /** Gemini рисует через свой обычный API (generateContent), а не через OpenAI-совместимый. */
+    private fun geminiImage(model: String, key: String, prompt: String): ByteArray {
+        val c = URL("https://generativelanguage.googleapis.com/v1beta/models/${model.removePrefix("models/")}:generateContent").openConnection() as HttpURLConnection
+        c.requestMethod = "POST"; c.connectTimeout = 20_000; c.readTimeout = 180_000
+        c.setRequestProperty("Content-Type", "application/json")
+        c.setRequestProperty("x-goog-api-key", key)
+        val body = buildJsonObject {
+            put("contents", buildJsonArray { add(buildJsonObject { put("parts", buildJsonArray { add(buildJsonObject { put("text", prompt) }) }) }) })
+            put("generationConfig", buildJsonObject { put("responseModalities", buildJsonArray { add(JsonPrimitive("IMAGE")) }) })
+        }
+        try {
+            c.doOutput = true
+            c.outputStream.use { it.write(body.toString().toByteArray()) }
+            if (c.responseCode !in 200..299) throw failureOf(c.responseCode, runCatching { c.errorStream?.bufferedReader()?.readText() }.getOrNull().orEmpty(),
+                Settings(provider = Provider.GEMINI, apiModel = model))
+            val o = json.parseToJsonElement(c.inputStream.bufferedReader().readText()).jsonObject
+            val parts = (((o["candidates"] as? JsonArray)?.firstOrNull() as? JsonObject)?.get("content") as? JsonObject)?.get("parts") as? JsonArray
+            val data = parts?.firstNotNullOfOrNull { p -> (((p as? JsonObject)?.get("inlineData") ?: (p as? JsonObject)?.get("inline_data")) as? JsonObject)?.get("data")?.let { (it as? JsonPrimitive)?.content } }
+                ?: throw EngineException("Gemini не нарисовал картинку — возможно, сцена не прошла его фильтр. Попробуй ещё раз.")
+            return Base64.decode(data, Base64.DEFAULT)
         } finally { c.disconnect() }
     }
 

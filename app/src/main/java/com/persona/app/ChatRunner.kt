@@ -502,7 +502,7 @@ class ChatRunner(private val app: App) {
                 val bytes = app.engines.api.generateImage(repo.settings.value, prompt)
                 val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: throw EngineException("Не удалось открыть картинку")
                 val file = repo.saveImageBitmap(bmp)
-                repo.updateChat(chatId) { cur -> cur.copy(messages = cur.messages.map { if (it.id == placeholder.id) it.copy(variants = listOf(prompt), image = file, info = "иллюстрация · ${s.imageModel.substringAfterLast('/')}") else it }) }
+                repo.updateChat(chatId) { cur -> cur.copy(messages = cur.messages.map { if (it.id == placeholder.id) it.copy(variants = listOf(prompt), image = file, info = "иллюстрация · ${ImageModels.title(ImageModels.effective(s).orEmpty())}") else it }) }
             } catch (e: CancellationException) {
                 repo.updateChat(chatId) { cur -> cur.copy(messages = cur.messages.filterNot { it.id == placeholder.id }) }
                 throw e
