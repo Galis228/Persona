@@ -21,7 +21,7 @@ class V05Test {
         assertEquals("deepseek/deepseek-chat-v3:free", ModelPick.recommend(Provider.OPENROUTER, listOf("openai/gpt-4o", "deepseek/deepseek-chat-v3:free", "openrouter/auto")))
         assertEquals("gemini-2.5-flash", ModelPick.recommend(Provider.GEMINI, listOf("gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite", "text-embedding-004", "gemini-2.5-flash-preview-tts")))
         assertEquals("gpt-4o-mini", ModelPick.recommend(Provider.OPENAI, listOf("gpt-4o", "gpt-4o-mini", "gpt-4o-mini-tts", "dall-e-3")))
-        assertEquals("claude-sonnet-4-5", ModelPick.recommend(Provider.CLAUDE, listOf("claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4")))
+        assertEquals("claude-haiku-4-5", ModelPick.recommend(Provider.CLAUDE, listOf("claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4")))
     }
 
     @Test fun parsesWorldInfo() {

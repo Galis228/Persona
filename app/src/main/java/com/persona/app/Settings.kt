@@ -220,8 +220,8 @@ fun SettingsHome(nav: Nav) {
                     if (e.local.hasModel(s)) "${ModelCatalog.title(s.activeModel)} · установлено: $installed" + if (DownloadWatch.live.isNotEmpty()) " · идёт загрузка" else ""
                     else if (DownloadWatch.live.isNotEmpty()) "Идёт загрузка…" else "Модель не скачана") { nav.go(Route.SettingsPage("local")) }
                 RowDivider()
-                SettingsRow(Icons.Rounded.Key, Color(0xFF3B4E7A), "API-ключ",
-                    if (e.api.ready(s)) "${s.provider.title} · ${s.apiModel.substringAfterLast('/')}" else "Не подключён · вход через OpenRouter в один тап") { nav.go(Route.SettingsPage("api")) }
+                SettingsRow(Icons.Rounded.Key, Color(0xFF3B4E7A), "Через интернет (API)",
+                    if (e.api.ready(s)) "${s.provider.title} · ${KnownModels.title(s.apiModel)}" else "Не подключено · пара шагов") { nav.go(Route.SettingsPage("api")) }
             }
         }
         // Ролплей
@@ -335,7 +335,7 @@ private fun SettingsRow(icon: ImageVector, tint: Color, title: String, sub: Stri
 @Composable
 fun SettingsPageScreen(nav: Nav, page: String) {
     val title = when (page) {
-        "local" -> "Модели на телефоне"; "api" -> "API-ключ"; "prompt" -> "Системный промпт"; "backup" -> "Резервная копия"; "look" -> "Оформление"; "updates" -> "Обновления"; "usage" -> "Расходы API"; "style" -> "Стиль ответов"; "memory" -> "Память"; "personas" -> "Мои персоны"; else -> "Настройки"
+        "local" -> "Модели на телефоне"; "api" -> "Через интернет (API)"; "prompt" -> "Системный промпт"; "backup" -> "Резервная копия"; "look" -> "Оформление"; "updates" -> "Обновления"; "usage" -> "Расходы API"; "style" -> "Стиль ответов"; "memory" -> "Память"; "personas" -> "Мои персоны"; else -> "Настройки"
     }
     Scaffold(topBar = {
         TopAppBar(navigationIcon = { IconButton({ nav.back() }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Назад") } },
@@ -345,7 +345,7 @@ fun SettingsPageScreen(nav: Nav, page: String) {
             verticalArrangement = Arrangement.spacedBy(12.dp)) {
             when (page) {
                 "local" -> LocalPage()
-                "api" -> ApiPage()
+                "api" -> ApiSetupPage()
                 "style" -> StylePage()
                 "memory" -> MemoryPage()
                 "personas" -> PersonasPage()
@@ -519,180 +519,6 @@ private fun Badge(text: String, color: Color = Accent) {
     Surface(shape = RoundedCornerShape(6.dp), color = color.copy(alpha = 0.18f)) {
         Text(text, Modifier.padding(horizontal = 7.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = color, fontWeight = FontWeight.Bold)
     }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun ApiPage() {
-    val ctx = LocalContext.current
-    val app = ctx.app
-    val repo = app.repo
-    val s by repo.settings.collectAsStateWithLifecycle()
-    val scope = rememberCoroutineScope()
-    val auth by OpenRouterAuth.state.collectAsStateWithLifecycle()
-    var keyText by remember { mutableStateOf(KeyCrypto.decrypt(s.apiKeyEnc)) }
-    var showKey by remember { mutableStateOf(false) }
-    var checking by remember { mutableStateOf(false) }
-    var status by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
-    var apiModels by remember { mutableStateOf<List<String>>(emptyList()) }
-    var pickModel by remember { mutableStateOf(false) }
-    var manual by remember { mutableStateOf(false) }
-    val connected = app.engines.api.ready(s)
-    var balance by remember { mutableStateOf<Double?>(null) }
-    LaunchedEffect(s.apiKeyEnc, s.provider) { balance = if (connected) app.engines.api.balance(s) else null }
-
-    fun connectWith(provider: Provider, key: String) {
-        checking = true; status = null
-        scope.launch {
-            val r = Connector.connect(ctx, provider, key)
-            if (r.ok) { keyText = key; apiModels = r.models }
-            status = r.ok to r.message
-            checking = false
-        }
-    }
-    fun pasteAndConnect(preferred: Provider?) {
-        val clip = ctx.getSystemService(ClipboardManager::class.java).primaryClip?.getItemAt(0)?.coerceToText(ctx)?.toString()?.trim().orEmpty()
-        if (!KeyLinks.looksLikeKey(clip)) { status = false to "В буфере нет ключа. Скопируй его на сайте провайдера и нажми ещё раз."; return }
-        connectWith(KeyLinks.detect(clip) ?: preferred ?: s.provider, clip)
-    }
-    LaunchedEffect(auth) { if (auth is OpenRouterAuth.State.Done) { keyText = KeyCrypto.decrypt(repo.settings.value.apiKeyEnc); status = true to (auth as OpenRouterAuth.State.Done).message } }
-
-    // ---------- Статус ----------
-    if (connected) Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) {
-        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(40.dp).clip(CircleShape).background(Mint.copy(alpha = 0.2f)), contentAlignment = Alignment.Center) { Icon(Icons.Rounded.Check, null, tint = Mint) }
-            Spacer(Modifier.size(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text("${s.provider.title} подключён", fontWeight = FontWeight.Bold)
-                Text(s.apiModel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
-                balance?.let { b -> Text("Баланс: " + String.format(java.util.Locale.US, "$%.2f", b), style = MaterialTheme.typography.bodySmall,
-                    color = if (b < 0.1) MaterialTheme.colorScheme.error else Mint) }
-            }
-            TextButton({
-                if (apiModels.isEmpty()) scope.launch { runCatching { app.engines.api.listModels(repo.settings.value) }.onSuccess { apiModels = it } }
-                pickModel = true
-            }) { Text("Модель") }
-        }
-    }
-    status?.let { (ok, msg) -> Text(msg, color = if (ok) Mint else MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium) }
-
-    // ---------- Быстрое подключение ----------
-    SectionTitle(if (connected) "Подключить другой" else "Быстрое подключение")
-    // OpenRouter: вход в один тап
-    Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainer, modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("OpenRouter", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.size(8.dp)); Badge("Проще всего")
-            }
-            Text("Сотни моделей по одному входу, есть бесплатные. Войди через браузер — ключ создастся и подключится сам.",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            when (val a = auth) {
-                OpenRouterAuth.State.Waiting -> Row(verticalAlignment = Alignment.CenterVertically) {
-                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp); Spacer(Modifier.size(10.dp))
-                    Text("Жду входа в браузере… После входа нажми «Вернуться в Персону».", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                    TextButton({ OpenRouterAuth.reset() }) { Text("Отмена") }
-                }
-                OpenRouterAuth.State.Exchanging -> Row(verticalAlignment = Alignment.CenterVertically) {
-                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp); Spacer(Modifier.size(10.dp)); Text("Получаю ключ…")
-                }
-                is OpenRouterAuth.State.Failed -> Text(a.message, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                else -> {}
-            }
-            Button({ OpenRouterAuth.start(ctx) }, Modifier.fillMaxWidth().height(48.dp),
-                enabled = auth != OpenRouterAuth.State.Waiting && auth != OpenRouterAuth.State.Exchanging) { Text("Войти через OpenRouter") }
-        }
-    }
-    // Остальные: получить ключ → вставить
-    listOf(
-        Provider.GEMINI to "Модели Google, есть бесплатный лимит",
-        Provider.OPENAI to "Модели GPT, оплата по использованию",
-        Provider.CLAUDE to "Модели Claude, оплата по использованию",
-    ).forEach { (p, note) ->
-        Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainer, modifier = Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(p.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Text(note, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton({ KeyLinks.url(p)?.let { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(it))) } }, Modifier.weight(1f)) { Text("1. Получить ключ") }
-                    Button({ pasteAndConnect(p) }, Modifier.weight(1f), enabled = !checking) {
-                        if (checking) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary) else Text("2. Вставить")
-                    }
-                }
-            }
-        }
-    }
-    Text("Скопируй ключ на сайте и нажми «Вставить» — приложение само поймёт, чей это ключ, проверит его и выберет модель.",
-        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-
-    // ---------- Вручную ----------
-    TextButton({ manual = !manual }) { Text(if (manual) "Скрыть ручную настройку" else "Ручная настройка и свой сервер") }
-    if (manual) {
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Provider.entries.forEach { p ->
-                FilterChip(s.provider == p, {
-                    if (s.provider != p) { repo.settings { it.copy(provider = p, apiModel = "") }; apiModels = emptyList(); status = null }
-                }, { Text(p.title) }, leadingIcon = if (s.provider == p) ({ Icon(Icons.Rounded.Check, null, Modifier.size(18.dp)) }) else null)
-            }
-        }
-        CardBox {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (s.provider == Provider.CUSTOM) OutlinedTextField(s.baseUrl, { v -> repo.settings { it.copy(baseUrl = v.trim()) } }, Modifier.fillMaxWidth(),
-                    label = { Text("Адрес сервера") }, placeholder = { Text("http://192.168.1.10:1234/v1") }, singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), shape = RoundedCornerShape(14.dp),
-                    supportingText = { Text("LM Studio, Ollama и другие OpenAI-совместимые серверы") })
-                OutlinedTextField(keyText, { v ->
-                    keyText = v.trim(); status = null
-                    KeyLinks.detect(keyText)?.let { p -> if (p != s.provider && s.provider != Provider.CUSTOM) repo.settings { it.copy(provider = p, apiModel = "") } }
-                    repo.settings { it.copy(apiKeyEnc = KeyCrypto.encrypt(keyText)) }
-                }, Modifier.fillMaxWidth(), label = { Text("Ключ") }, placeholder = { Text(s.provider.keyHint) }, singleLine = true, shape = RoundedCornerShape(14.dp),
-                    visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
-                    trailingIcon = { IconButton({ showKey = !showKey }) { Icon(if (showKey) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility, "Показать ключ") } },
-                    supportingText = { Text("Хранится зашифрованным на телефоне") })
-                Button({ connectWith(s.provider, keyText) }, Modifier.fillMaxWidth().height(48.dp), enabled = !checking && (keyText.isNotBlank() || s.provider == Provider.CUSTOM)) {
-                    if (checking) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary) else Text("Проверить и подключить")
-                }
-                Surface(onClick = { pickModel = true }, shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
-                    Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("Модель", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Text(s.apiModel.ifBlank { "Не выбрана" }, fontWeight = FontWeight.Bold)
-                        }
-                        Icon(Icons.Rounded.Edit, null, tint = MaterialTheme.colorScheme.primary)
-                    }
-                }
-            }
-        }
-    }
-    if (connected) TextButton({ repo.settings { it.copy(apiKeyEnc = "", apiModel = "") }; keyText = ""; status = null; OpenRouterAuth.reset() }) {
-        Text("Отключить API", color = MaterialTheme.colorScheme.error)
-    }
-
-    SectionTitle("Картинки сцен")
-    CardBox {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Кнопка «Нарисовать сцену» в чате превращает текущий момент в иллюстрацию. Рисует модель картинок того же провайдера и ключа.",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (s.provider == Provider.CLAUDE) Text("Claude не рисует картинки — для них выбери другой провайдер.", style = MaterialTheme.typography.bodySmall, color = Amber)
-            else {
-                OutlinedTextField(s.imageModel, { v -> repo.settings { it.copy(imageModel = v.trim()) } }, Modifier.fillMaxWidth(), singleLine = true, shape = RoundedCornerShape(14.dp),
-                    label = { Text("Модель для картинок") }, placeholder = { Text(when (s.provider) {
-                        Provider.OPENROUTER -> "например, google/gemini-2.5-flash-image"
-                        Provider.OPENAI -> "например, gpt-image-1"
-                        Provider.GEMINI -> "например, imagen-4.0-generate-001"
-                        else -> "название модели"
-                    }) })
-                if (apiModels.isNotEmpty()) {
-                    val img = apiModels.filter { m -> listOf("image", "imagen", "dall-e", "flux", "diffusion").any { m.contains(it, true) } }.take(8)
-                    if (img.isNotEmpty()) FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        img.forEach { m -> FilterChip(s.imageModel == m, { repo.settings { it.copy(imageModel = m) } }, { Text(m.substringAfterLast('/'), maxLines = 1) }) }
-                    }
-                }
-                Text("Картинки обычно платные: проверь цену модели у провайдера.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-    }
-    if (pickModel) ApiModelPicker(apiModels, s.apiModel, { m -> repo.settings { it.copy(apiModel = m) }; pickModel = false }) { pickModel = false }
 }
 
 @Composable
@@ -1128,7 +954,8 @@ private fun UsagePage() {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(title, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(if (l.any { it.costKnown }) money(l.sumOf { it.cost }) else "—", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold, color = Accent)
-                Text("${l.sumOf { it.requests }} запросов · вход ${tokens(l.sumOf { it.inTok })} · ответы ${tokens(l.sumOf { it.outTok })} токенов",
+                Text("${l.sumOf { it.requests }} запросов · вход ${tokens(l.sumOf { it.inTok })} · ответы ${tokens(l.sumOf { it.outTok })} токенов" +
+                    (l.sumOf { it.inTok }.takeIf { it > 0 }?.let { tot -> l.sumOf { it.cachedTok }.takeIf { it > 0 }?.let { " · из кэша ${it * 100 / tot}%" } } ?: ""),
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
@@ -1317,32 +1144,6 @@ fun LabeledSlider(title: String, v: Float, range: ClosedFloatingPointRange<Float
         Row { Text(title, Modifier.weight(1f), fontWeight = FontWeight.SemiBold); Text(String.format(java.util.Locale.US, fmt, v).replace('.', ','), fontWeight = FontWeight.Bold, color = Accent) }
         Slider(v, onChange, valueRange = range)
     }
-}
-
-@Composable
-private fun ApiModelPicker(models: List<String>, current: String, onPick: (String) -> Unit, onClose: () -> Unit) {
-    var q by remember { mutableStateOf("") }
-    AlertDialog(onClose,
-        title = { Text("Модель API") },
-        text = {
-            Column {
-                OutlinedTextField(q, { q = it }, Modifier.fillMaxWidth(), singleLine = true,
-                    placeholder = { Text(if (models.isEmpty()) "Впиши название модели" else "Поиск среди ${models.size}") })
-                Spacer(Modifier.size(8.dp))
-                val shown = models.filter { q.isBlank() || it.contains(q.trim(), true) }.take(200)
-                if (models.isEmpty()) Text("Нажми «Проверить ключ», чтобы загрузить список, или впиши название вручную и нажми «Готово».",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                LazyColumn(Modifier.heightIn(max = 360.dp)) {
-                    items(shown) { m ->
-                        Row(Modifier.fillMaxWidth().clickable { onPick(m) }.padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                            RadioButton(m == current, { onPick(m) })
-                            Text(m, style = MaterialTheme.typography.bodyMedium)
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = { TextButton({ if (q.isNotBlank()) onPick(q.trim()) else onClose() }) { Text("Готово") } })
 }
 
 private suspend fun speedTest(app: App, s: Settings): String {

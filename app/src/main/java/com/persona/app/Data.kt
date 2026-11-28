@@ -183,11 +183,11 @@ data class UpdateInfo(val repo: String = DEFAULT_REPO, val lastCheck: Long = 0, 
 const val DEFAULT_REPO = "Galis228/Persona"
 
 @Serializable
-data class Price(val inPerM: Double = 0.0, val outPerM: Double = 0.0)
+data class Price(val inPerM: Double = 0.0, val outPerM: Double = 0.0, val cachedPerM: Double? = null)
 
 /** Расход API за день по одной модели. */
 @Serializable
-data class UsageDay(val date: String, val model: String, val inTok: Long = 0, val outTok: Long = 0, val cost: Double = 0.0, val costKnown: Boolean = false, val requests: Int = 0)
+data class UsageDay(val date: String, val model: String, val inTok: Long = 0, val outTok: Long = 0, val cost: Double = 0.0, val costKnown: Boolean = false, val requests: Int = 0, val cachedTok: Long = 0)
 
 @Serializable enum class Mode { AUTO, LOCAL, API }
 @Serializable enum class Preset(val title: String, val temp: Float, val topP: Float, val rep: Float) {
@@ -206,6 +206,7 @@ data class UsageDay(val date: String, val model: String, val inTok: Long = 0, va
     GEMINI("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "AIza…"),
     OPENAI("OpenAI", "https://api.openai.com/v1", "sk-…"),
     CLAUDE("Claude", "https://api.anthropic.com/v1", "sk-ant-…"),
+    DEEPSEEK("DeepSeek", "https://api.deepseek.com/v1", "sk-…"),
     CUSTOM("Свой URL", "", "ключ"),
 }
 
@@ -264,6 +265,10 @@ data class Settings(
     val onboarded: Boolean = false,
     /** Цены за 1 млн токенов по моделям API: вход и выход, в долларах. */
     val prices: Map<String, Price> = emptyMap(),
+    /** Сколько токенов переписки отправлять модели API за раз (остальное — в сжатой памяти). */
+    val apiContext: Int = 12000,
+    /** Кэш промпта: неизменная часть идёт первой, провайдер берёт за неё дешевле. */
+    val promptCache: Boolean = true,
 ) {
     val user: String get() = userName.ifBlank { "Пользователь" }
     fun persona(id: String?): Persona? = personas.firstOrNull { it.id == (id ?: defaultPersonaId) }
@@ -370,14 +375,14 @@ class Repo(private val ctx: Context) {
     fun scene(id: String?) = _scenes.value.firstOrNull { it.id == id }
 
     // ---------- Расходы API ----------
-    fun addUsage(model: String, inTok: Long, outTok: Long, reportedCost: Double?) {
+    fun addUsage(model: String, inTok: Long, outTok: Long, reportedCost: Double?, cachedTok: Long = 0) {
         val date = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
-        val price = _settings.value.prices[model]
-        val cost = reportedCost ?: price?.let { (inTok * it.inPerM + outTok * it.outPerM) / 1_000_000.0 }
+        val price = _settings.value.prices[model] ?: KnownModels.price(model)
+        val cost = reportedCost ?: price?.let { KnownModels.cost(it, inTok, cachedTok, outTok) }
         _usage.update { l ->
             val cur = l.firstOrNull { it.date == date && it.model == model } ?: UsageDay(date, model)
             val n = cur.copy(inTok = cur.inTok + inTok, outTok = cur.outTok + outTok, cost = cur.cost + (cost ?: 0.0),
-                costKnown = cur.costKnown || cost != null, requests = cur.requests + 1)
+                costKnown = cur.costKnown || cost != null, requests = cur.requests + 1, cachedTok = cur.cachedTok + cachedTok)
             (l.filterNot { it.date == date && it.model == model } + n).takeLast(2000)
         }
         val snap = _usage.value

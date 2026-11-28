@@ -11,7 +11,18 @@ data class GenRequest(
     val rep: Float,
     /** Фото к последней реплике пользователя (JPEG). */
     val image: ByteArray? = null,
-)
+    /** Изменчивая приписка к последней реплике (время, настроение, лор) — отдельно, чтобы не ломать кэш промпта. */
+    val tail: String = "",
+    /** Метка для кэша OpenAI: запросы одного чата попадают на один сервер. */
+    val cacheKey: String? = null,
+) {
+    /** История с припиской, вклеенной в последнюю реплику, — для движков без отдельных блоков. */
+    fun folded(): List<Turn> {
+        if (tail.isBlank() || history.isEmpty()) return history
+        val l = history.last()
+        return history.dropLast(1) + l.copy(text = l.text + "\n\n" + tail)
+    }
+}
 
 /** Сборка промптов. Чистые функции — без Android, чтобы их можно было проверить тестом. */
 const val MOOD_RULE = "В самом конце ответа на отдельной строке добавь служебную пометку строго в формате [настроение: <одно слово: радостное, игривое, спокойное, грустное, злое, обиженное, удивлённое или смущённое>; отношение: <число от -3 до 3>] — как изменилось отношение к собеседнику после этой реплики. Пометку игрок не увидит."
@@ -100,17 +111,38 @@ object Prompt {
     fun routine(c: Character, now: String = nowLabel()): String = if (!c.routineEnabled || c.routine.isBlank()) "" else
         "Распорядок дня ${c.name}:\n${c.routine.trim()}\nСейчас $now. Веди себя так, будто ${c.name} сейчас занят(а) тем, что по распорядку (спит — отвечает сонно и коротко, на работе — отвлекается и т. п.)."
 
-    fun system(c: Character, chat: Chat, s: Settings, books: List<Lorebook>, recent: String): String {
+    /**
+     * [stable] — без изменчивых частей (настроение, время, лор): они уходят в [dynamic],
+     * а начало промпта остаётся одинаковым от сообщения к сообщению и берётся из кэша провайдера.
+     */
+    fun system(c: Character, chat: Chat, s: Settings, books: List<Lorebook>, recent: String, stable: Boolean = false): String {
         val user = s.user
-        val extra = listOf(about(s), moodState(c, chat, user), routine(c)).filter { it.isNotBlank() }.joinToString("\n\n")
+        val extra = (if (stable) listOf(about(s)) else listOf(about(s), moodState(c, chat, user), routine(c))).filter { it.isNotBlank() }.joinToString("\n\n")
         val body = s.systemTemplate.ifBlank { DEFAULT_TEMPLATE }
         val cardText = card(c, user) + if (extra.isNotBlank()) "\n\n$extra" else ""
-        val mem = memory(chat, c, user); val lr = lore(c, books, recent); val rl = rules(s, c, user)
+        val mem = memory(chat, c, user); val lr = if (stable) "" else lore(c, books, recent); val rl = rules(s, c, user)
         val body2 = body.replace("{{card}}", cardText).replace("{{описание}}", cardText)
             .replace("{{memory}}", mem).replace("{{память}}", mem)
             .replace("{{lore}}", lr).replace("{{лор}}", lr)
             .replace("{{rules}}", rl).replace("{{правила}}", rl)
         return fill(body2, c.name, user).replace(Regex("\n{3,}"), "\n\n").trim()
+    }
+
+    /** Изменчивая часть контекста для приписки к последней реплике. */
+    fun dynamic(c: Character, chat: Chat, s: Settings, books: List<Lorebook>, recent: String, loreOf: Character = c): String {
+        val parts = listOf(moodState(c, chat, s.user), routine(c), lore(loreOf, books, recent)).filter { it.isNotBlank() }
+        return if (parts.isEmpty()) "" else "(Для тебя, собеседник этого не видит:\n" + parts.joinToString("\n\n") + ")"
+    }
+
+    /** Кэш-дружелюбная история: старые сообщения отбрасываются пачками по [step], чтобы начало не менялось каждый раз. */
+    fun stableHistory(msgs: List<Msg>, budget: Int, step: Int = 10): List<Turn> {
+        var from = 0
+        while (from < msgs.size) {
+            val h = history(msgs.drop(from), Int.MAX_VALUE)
+            if (h.sumOf { estimateTokens(it.text) } <= budget) return h
+            from += step
+        }
+        return history(msgs, budget)
     }
 
     /** Берёт сообщения с конца, пока влезают в бюджет; склеивает подряд идущие реплики одной стороны. */
@@ -153,16 +185,18 @@ object Prompt {
     fun reply(c: Character, chat: Chat, s: Settings, books: List<Lorebook>, msgs: List<Msg>, local: Boolean, instruction: String? = null): GenRequest {
         val visible = msgs.drop(chat.summarizedUpTo.coerceAtMost(maxOf(0, msgs.size - 6)))
         val recent = visible.takeLast(6).joinToString("\n") { it.text }
-        val system = system(c, chat, s, books, recent)
-        val ctx = if (local) s.contextTokens else 24000
+        val cache = !local && s.promptCache
+        val system = system(c, chat, s, books, recent, stable = cache)
+        val tail = if (cache) dynamic(c, chat, s, books, recent) else ""
+        val ctx = if (local) s.contextTokens else s.apiContext
         val out = s.length.maxOut
-        val budget = (ctx - out - estimateTokens(system) - 64).coerceAtLeast(200)
-        var hist = history(visible, budget)
+        val budget = (ctx - out - estimateTokens(system) - estimateTokens(tail) - 64).coerceAtLeast(200)
+        var hist = if (cache) stableHistory(visible, budget) else history(visible, budget)
         val needsTail = instruction != null || hist.isEmpty() || !hist.last().user
         if (needsTail) hist = hist + Turn(true, "(${instruction ?: "Продолжай сцену от лица ${c.name}."})")
         hist = withNote(hist, chat.authorNote)
         val (t, p, r) = sampling(s, c)
-        return GenRequest(system, hist, out, t, p, r)
+        return GenRequest(system, hist, out, t, p, r, tail = tail, cacheKey = "persona-${c.id}")
     }
 
     /** Заметка автора — скрытая подсказка к ближайшим ответам, добавляется к последней реплике. */
@@ -347,23 +381,25 @@ object Prompt {
     fun sceneReply(sc: Scene, c: Character, chars: List<Character>, chat: Chat, s: Settings, books: List<Lorebook>, local: Boolean, instruction: String? = null): GenRequest {
         val map = chars.associateBy { it.id }
         val recent = chat.messages.takeLast(6).joinToString("\n") { it.text }
+        val cache = !local && s.promptCache
         val sys = buildString {
             append(sceneIntro(sc, chars, chat.hero, s))
             if (sc.mode == SceneMode.HANGOUT) append("\n\nТы — ${c.name}. Пиши только свои сообщения, как в групповом мессенджере: можешь отвечать ${s.user} или другим участникам, обращаться к ним по имени, подхватывать и подкалывать. Не пиши за других.")
             else append("\n\nТвоя роль — ТОЛЬКО ${c.name}. Не пиши реплики и действия других участников, рассказчика и игрока ${s.user}.")
             append("\n\n" + card(c, s.user))
-            moodState(c, chat, s.user).takeIf { it.isNotBlank() }?.let { append("\n\n$it") }
+            if (!cache) moodState(c, chat, s.user).takeIf { it.isNotBlank() }?.let { append("\n\n$it") }
             memory(chat, c, s.user).takeIf { it.isNotBlank() }?.let { append("\n\n$it") }
-            lore(c.copy(lorebookIds = c.lorebookIds + sc.lorebookIds), books, recent).takeIf { it.isNotBlank() }?.let { append("\n\n$it") }
+            if (!cache) lore(c.copy(lorebookIds = c.lorebookIds + sc.lorebookIds), books, recent).takeIf { it.isNotBlank() }?.let { append("\n\n$it") }
             append("\n\n" + rules(s, c, s.user))
         }
-        val ctx = if (local) s.contextTokens else 24000
+        val tail = if (cache) dynamic(c.copy(routineEnabled = false), chat, s, books, recent, c.copy(lorebookIds = c.lorebookIds + sc.lorebookIds)) else ""
+        val ctx = if (local) s.contextTokens else s.apiContext
         val out = s.length.maxOut
-        var hist = sceneHistory(chat.messages, c.id, map, s.user, (ctx - out - estimateTokens(sys) - 64).coerceAtLeast(200))
+        var hist = sceneHistory(chat.messages, c.id, map, s.user, (ctx - out - estimateTokens(sys) - estimateTokens(tail) - 64).coerceAtLeast(200))
         hist = hist + Turn(true, "(${instruction ?: "Твоя реплика — ты ${c.name}."})")
         val merged = withNote(history(hist.map { Msg(fromUser = it.user, variants = listOf(it.text)) }, Int.MAX_VALUE), chat.authorNote)
         val (t, p, r) = sampling(s, c)
-        return GenRequest(sys, merged, out, t, p, r)
+        return GenRequest(sys, merged, out, t, p, r, tail = tail, cacheKey = "persona-scene-${sc.id}")
     }
 
     const val EVENT_HINT = "Внеси неожиданный поворот: случайное событие, которое меняет ситуацию (кто-то появляется, что-то ломается, приходит весть и т. п.)."
@@ -379,7 +415,7 @@ object Prompt {
             lore(Character(name = "", lorebookIds = sc.lorebookIds + chars.flatMap { it.lorebookIds }), books, recent).takeIf { it.isNotBlank() }?.let { append("\n\n$it") }
             append("\nОтвечай на том языке, на котором пишет игрок.")
         }
-        val ctx = if (local) s.contextTokens else 24000
+        val ctx = if (local) s.contextTokens else s.apiContext
         var hist = sceneHistory(chat.messages, NARRATOR, map, s.user, (ctx - 300 - estimateTokens(sys) - 64).coerceAtLeast(200))
         hist = hist + Turn(true, "(${instruction ?: "Рассказчик, опиши, что происходит дальше."})")
         val merged = withNote(history(hist.map { Msg(fromUser = it.user, variants = listOf(it.text)) }, Int.MAX_VALUE), chat.authorNote)

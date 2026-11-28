@@ -180,8 +180,9 @@ class LocalEngine(private val ctx: Context) {
         genLock.withLock {
             unloadJob?.cancel()
             val e = ensure(s, gpu, vision = r.image != null)
-            val initial = r.history.dropLast(1).map { if (it.user) Message.user(it.text) else Message.model(it.text) }
-            val last = r.history.lastOrNull()?.text ?: "Привет"
+            val hist = r.folded()
+            val initial = hist.dropLast(1).map { if (it.user) Message.user(it.text) else Message.model(it.text) }
+            val last = hist.lastOrNull()?.text ?: "Привет"
             val cfg = ConversationConfig(Contents.of(r.system), initial, emptyList(),
                 SamplerConfig(40, r.topP.toDouble(), r.temperature.toDouble(), 0))
             val conv = e.createConversation(cfg)
@@ -232,9 +233,10 @@ class ApiEngine(private val repo: Repo? = null) {
     }
 
     /** Превращает ответ сервера с ошибкой в понятное сообщение: что случилось и что делать. */
-    private fun failure(c: HttpURLConnection, s: Settings): EngineException {
-        val code = c.responseCode
-        val body = runCatching { c.errorStream?.bufferedReader()?.readText() }.getOrNull().orEmpty()
+    private fun failure(c: HttpURLConnection, s: Settings): EngineException =
+        failureOf(c.responseCode, runCatching { c.errorStream?.bufferedReader()?.readText() }.getOrNull().orEmpty(), s)
+
+    private fun failureOf(code: Int, body: String, s: Settings): EngineException {
         val msg = runCatching {
             val o = json.parseToJsonElement(body).jsonObject
             when (val e = o["error"]) {
@@ -246,8 +248,11 @@ class ApiEngine(private val repo: Repo? = null) {
         return ApiErrors.classify(code, body, msg, s)
     }
 
-    /** Модели OpenAI с рассуждениями (o1/o3/o4, gpt-5) не принимают temperature и max_tokens. */
-    private fun reasoning(model: String) = Regex("^(openai/)?(o\\d|gpt-5)").containsMatchIn(model.lowercase())
+    /** Модели OpenAI с рассуждениями (o1/o3/o4, gpt-5 и новее) не принимают temperature и max_tokens. */
+    private fun reasoning(model: String) = Regex("^(openai/)?(o\\d|gpt-([5-9]|\\d\\d))").containsMatchIn(model.lowercase())
+
+    /** Модели, которым мы уже отправляли «лишние» параметры и получили отказ — дальше шлём только самое нужное. */
+    private val minimalModels = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     /** Проверяет ключ по-настоящему (для OpenRouter список моделей открыт и без ключа). */
     suspend fun checkKey(s: Settings, key: String) = withContext(Dispatchers.IO) {
@@ -271,65 +276,120 @@ class ApiEngine(private val repo: Repo? = null) {
         }.getOrNull()
     }
 
+    /** Маленький настоящий запрос: модель жива, ключ рабочий, деньги на счету есть. */
+    suspend fun ping(s: Settings, key: String) {
+        val r = GenRequest("Отвечай одним словом.", listOf(Turn(true, "Скажи: готово")), 8, 0.2f, 1f, 1f)
+        generate(s, r, key, record = false).collect { }
+    }
+
     fun key(s: Settings) = KeyCrypto.decrypt(s.apiKeyEnc)
     fun ready(s: Settings) = s.apiKeyEnc.isNotBlank() && s.apiModel.isNotBlank() && s.apiBase.isNotBlank()
 
-    fun generate(s: Settings, r: GenRequest): Flow<String> = flow {
-        val key = key(s)
-        if (key.isBlank()) throw EngineException("Не указан API-ключ. Открой «Модель» → «API-ключ».")
-        if (s.apiModel.isBlank()) throw EngineException("Не выбрана модель API. Открой «Модель» → «API-ключ».")
+    private fun cacheOn(s: Settings) = s.promptCache && (s.provider == Provider.CLAUDE || (s.provider == Provider.OPENROUTER && s.apiModel.startsWith("anthropic/")))
+
+    private fun body(s: Settings, r: GenRequest, minimal: Boolean, completionTokens: Boolean): JsonObject {
         val claude = s.provider == Provider.CLAUDE
+        val marks = cacheOn(s) // метки cache_control для Claude (напрямую и через OpenRouter)
         val turns = r.history.toMutableList()
         if (claude && turns.firstOrNull()?.user == false) turns.add(0, Turn(true, "(Начало ролевой переписки)"))
+        if (turns.isEmpty()) turns += Turn(true, "(Продолжай.)")
         val img64 = r.image?.let { Base64.encodeToString(it, Base64.NO_WRAP) }
+        fun text(t: String, cache: Boolean) = buildJsonObject {
+            put("type", "text"); put("text", t)
+            if (cache) put("cache_control", buildJsonObject { put("type", "ephemeral") })
+        }
         val msgs = buildJsonArray {
-            if (!claude) add(buildJsonObject { put("role", "system"); put("content", r.system) })
+            if (!claude) add(buildJsonObject {
+                put("role", "system")
+                if (marks) put("content", buildJsonArray { add(text(r.system, true)) }) else put("content", r.system)
+            })
             turns.forEachIndexed { i, t ->
+                val last = i == turns.lastIndex
                 add(buildJsonObject {
                     put("role", if (t.user) "user" else "assistant")
-                    if (img64 != null && i == turns.lastIndex && t.user) put("content", buildJsonArray {
-                        if (claude) add(buildJsonObject {
-                            put("type", "image")
-                            put("source", buildJsonObject { put("type", "base64"); put("media_type", "image/jpeg"); put("data", img64) })
-                        }) else add(buildJsonObject {
-                            put("type", "image_url"); put("image_url", buildJsonObject { put("url", "data:image/jpeg;base64,$img64") })
-                        })
-                        add(buildJsonObject { put("type", "text"); put("text", t.text) })
-                    }) else put("content", t.text)
+                    val tail = if (last && t.user) r.tail else ""
+                    val image = img64 != null && last && t.user
+                    if (image || (last && marks) || (tail.isNotBlank() && marks)) put("content", buildJsonArray {
+                        if (image) {
+                            if (claude) add(buildJsonObject {
+                                put("type", "image")
+                                put("source", buildJsonObject { put("type", "base64"); put("media_type", "image/jpeg"); put("data", img64) })
+                            }) else add(buildJsonObject {
+                                put("type", "image_url"); put("image_url", buildJsonObject { put("url", "data:image/jpeg;base64,$img64") })
+                            })
+                        }
+                        // Метка кэша стоит до изменчивой приписки: всё, что выше, в следующий раз возьмётся из кэша
+                        add(text(t.text, marks && last))
+                        if (tail.isNotBlank()) add(text(tail, false))
+                    }) else put("content", if (tail.isNotBlank()) t.text + "\n\n" + tail else t.text)
                 })
             }
         }
-        val body = buildJsonObject {
+        val reason = reasoning(s.apiModel) && s.provider != Provider.OPENROUTER
+        return buildJsonObject {
             put("model", s.apiModel)
             put("messages", msgs)
             put("stream", true)
-            if (claude || !reasoning(s.apiModel) || s.provider == Provider.OPENROUTER) put("max_tokens", r.maxOut)
             if (claude) {
-                put("system", r.system)
-                put("temperature", r.temperature.coerceIn(0f, 1f))
-            } else if (reasoning(s.apiModel) && s.provider != Provider.OPENROUTER) {
-                // Новые модели OpenAI: только max_completion_tokens, без temperature/top_p
-                put("max_completion_tokens", r.maxOut * 4)
+                put("max_tokens", r.maxOut)
+                if (marks) put("system", buildJsonArray { add(text(r.system, true)) }) else put("system", r.system)
+                if (!minimal) put("temperature", r.temperature.coerceIn(0f, 1f))
+                return@buildJsonObject
+            }
+            if (s.provider == Provider.OPENAI || s.provider == Provider.OPENROUTER || s.provider == Provider.DEEPSEEK)
                 put("stream_options", buildJsonObject { put("include_usage", true) })
-            } else {
-                put("temperature", r.temperature)
-                put("top_p", r.topP)
-                if (s.provider != Provider.GEMINI) put("stream_options", buildJsonObject { put("include_usage", true) })
-                if (s.provider == Provider.OPENROUTER) put("usage", buildJsonObject { put("include", true) })
-                when (s.provider) {
-                    Provider.OPENROUTER -> put("repetition_penalty", r.rep)
-                    Provider.OPENAI, Provider.CUSTOM -> put("frequency_penalty", ((r.rep - 1f) * 2f).coerceIn(0f, 2f))
-                    else -> {}
-                }
+            if (reason || completionTokens) put("max_completion_tokens", if (reason) r.maxOut * 4 + 256 else r.maxOut)
+            else put("max_tokens", r.maxOut)
+            if (minimal) return@buildJsonObject
+            if (s.provider == Provider.OPENAI && s.promptCache) r.cacheKey?.let { put("prompt_cache_key", it) }
+            if (reason) {
+                // Меньше скрытых «размышлений» — меньше платных токенов
+                put("reasoning_effort", "low")
+                return@buildJsonObject
+            }
+            put("temperature", r.temperature)
+            put("top_p", r.topP)
+            if (s.provider == Provider.OPENROUTER) put("usage", buildJsonObject { put("include", true) })
+            when (s.provider) {
+                Provider.OPENROUTER -> put("repetition_penalty", r.rep)
+                Provider.OPENAI, Provider.CUSTOM, Provider.DEEPSEEK -> put("frequency_penalty", ((r.rep - 1f) * 2f).coerceIn(0f, 2f))
+                else -> {}
             }
         }
-        val c = open(s.apiBase + if (claude) "/messages" else "/chat/completions", s, key)
-        var inTok: Long? = null; var outTok: Long? = null; var cost: Double? = null; var outChars = 0
+    }
+
+    fun generate(s: Settings, r: GenRequest, keyOverride: String? = null, record: Boolean = true): Flow<String> = flow {
+        val key = keyOverride ?: key(s)
+        if (key.isBlank() && s.provider != Provider.CUSTOM) throw EngineException("Не указан API-ключ. Открой «Настройки → Через интернет».")
+        if (s.apiModel.isBlank()) throw EngineException("Не выбрана модель API. Открой «Настройки → Через интернет».")
+        val claude = s.provider == Provider.CLAUDE
+        var minimal = s.apiModel in minimalModels
+        var completionTokens = false
+        var c: HttpURLConnection
+        var attempt = 0
+        while (true) {
+            c = open(s.apiBase + if (claude) "/messages" else "/chat/completions", s, key)
+            c.doOutput = true
+            c.outputStream.use { it.write(body(s, r, minimal, completionTokens).toString().toByteArray()) }
+            val code = c.responseCode
+            if (code in 200..299) break
+            val err = runCatching { c.errorStream?.bufferedReader()?.readText() }.getOrNull().orEmpty()
+            c.disconnect()
+            val low = err.lowercase()
+            val paramProblem = code == 400 && listOf("unsupported", "not supported", "unrecognized", "unknown parameter", "extra inputs", "does not support", "invalid_request_error").any { low.contains(it) } &&
+                listOf("temperature", "top_p", "max_tokens", "frequency_penalty", "repetition_penalty", "stream_options", "prompt_cache_key", "reasoning_effort", "cache_control", "parameter").any { low.contains(it) }
+            if (paramProblem && attempt < 2) {
+                // Модель не приняла часть параметров — пробуем ещё раз с самым простым запросом
+                attempt++
+                if (low.contains("max_tokens") && low.contains("max_completion_tokens")) completionTokens = true else { minimal = true; minimalModels += s.apiModel }
+                continue
+            }
+            throw failureOf(code, err, s)
+        }
+        var inTok: Long? = null; var outTok: Long? = null; var cost: Double? = null; var outChars = 0; var cached = 0L
+        var claudeIn = 0L
         fun num(o: JsonObject?, k: String) = (o?.get(k) as? JsonPrimitive)?.content?.toDoubleOrNull()
         try {
-            c.doOutput = true
-            c.outputStream.use { it.write(body.toString().toByteArray()) }
-            if (c.responseCode !in 200..299) throw failure(c, s)
             c.inputStream.bufferedReader().use { rd ->
                 while (true) {
                     val line = rd.readLine() ?: break
@@ -339,12 +399,20 @@ class ApiEngine(private val repo: Repo? = null) {
                     val o = runCatching { json.parseToJsonElement(data).jsonObject }.getOrNull() ?: continue
                     o["error"]?.let { throw EngineException("Ошибка API: ${(it as? JsonObject)?.get("message")?.jsonPrimitive?.content ?: it}") }
                     // Учёт токенов: OpenAI-совместимые присылают usage в конце, Claude — в message_start и message_delta
-                    (o["usage"] as? JsonObject)?.let { u ->
+                    fun readUsage(u: JsonObject) {
                         num(u, "prompt_tokens")?.let { inTok = it.toLong() }; num(u, "completion_tokens")?.let { outTok = it.toLong() }
-                        num(u, "input_tokens")?.let { inTok = it.toLong() }; num(u, "output_tokens")?.let { outTok = it.toLong() }
+                        num(u, "output_tokens")?.let { outTok = it.toLong() }
                         num(u, "cost")?.let { cost = it }
+                        (u["prompt_tokens_details"] as? JsonObject)?.let { d -> num(d, "cached_tokens")?.let { cached = it.toLong() } }
+                        num(u, "prompt_cache_hit_tokens")?.let { cached = it.toLong() } // DeepSeek
+                        if (claude) {
+                            val i = (num(u, "input_tokens") ?: 0.0) + (num(u, "cache_read_input_tokens") ?: 0.0) + (num(u, "cache_creation_input_tokens") ?: 0.0)
+                            if (i > 0) { claudeIn = i.toLong(); inTok = claudeIn }
+                            num(u, "cache_read_input_tokens")?.let { if (it > 0) cached = it.toLong() }
+                        } else num(u, "input_tokens")?.let { inTok = it.toLong() }
                     }
-                    ((o["message"] as? JsonObject)?.get("usage") as? JsonObject)?.let { u -> num(u, "input_tokens")?.let { inTok = it.toLong() } }
+                    (o["usage"] as? JsonObject)?.let { readUsage(it) }
+                    ((o["message"] as? JsonObject)?.get("usage") as? JsonObject)?.let { readUsage(it) }
                     val piece = if (claude) {
                         if (o["type"]?.jsonPrimitive?.content == "content_block_delta")
                             (o["delta"] as? JsonObject)?.get("text")?.jsonPrimitive?.content else null
@@ -358,9 +426,9 @@ class ApiEngine(private val repo: Repo? = null) {
             }
         } finally {
             c.disconnect()
-            if (outChars > 0 || inTok != null) runCatching {
-                val est = Prompt.estimateTokens(r.system) + r.history.sumOf { Prompt.estimateTokens(it.text) }
-                repo?.addUsage(s.apiModel, inTok ?: est.toLong(), outTok ?: (outChars / 3L), cost)
+            if (record && (outChars > 0 || inTok != null)) runCatching {
+                val est = Prompt.estimateTokens(r.system) + r.history.sumOf { Prompt.estimateTokens(it.text) } + Prompt.estimateTokens(r.tail)
+                repo?.addUsage(s.apiModel, inTok ?: est.toLong(), outTok ?: (outChars / 3L), cost, cached)
             }
         }
     }.flowOn(Dispatchers.IO)
@@ -368,9 +436,9 @@ class ApiEngine(private val repo: Repo? = null) {
     /** Рисует картинку по описанию тем же ключом. Возвращает байты PNG/JPEG. */
     suspend fun generateImage(s: Settings, prompt: String): ByteArray = withContext(Dispatchers.IO) {
         val key = key(s)
-        if (key.isBlank()) throw EngineException("Для картинок нужен API-ключ: «Настройки → API-ключ».")
+        if (key.isBlank()) throw EngineException("Для картинок нужен API-ключ: «Настройки → Через интернет».")
         if (s.provider == Provider.CLAUDE) throw EngineException("Claude не рисует картинки. Выбери OpenRouter, OpenAI или Gemini.")
-        if (s.imageModel.isBlank()) throw EngineException("Не указана модель для картинок: «Настройки → API-ключ → Картинки».")
+        if (s.imageModel.isBlank()) throw EngineException("Не указана модель для картинок: «Настройки → Через интернет → Картинки».")
         val openrouter = s.provider == Provider.OPENROUTER
         val body = if (openrouter) buildJsonObject {
             put("model", s.imageModel)
@@ -412,6 +480,15 @@ class ApiEngine(private val repo: Repo? = null) {
             if (c.responseCode !in 200..299) throw failure(c, s)
             val o = json.parseToJsonElement(c.inputStream.bufferedReader().readText()).jsonObject
             val arr = (o["data"] ?: o["models"])?.jsonArray ?: JsonArray(emptyList())
+            // OpenRouter присылает цены — запоминаем их (за токен → за миллион)
+            arr.forEach { m ->
+                val mo = m as? JsonObject ?: return@forEach
+                val id = (mo["id"] as? JsonPrimitive)?.content ?: return@forEach
+                val pr = mo["pricing"] as? JsonObject ?: return@forEach
+                fun per(k: String) = (pr[k] as? JsonPrimitive)?.content?.toDoubleOrNull()?.times(1_000_000)
+                val pin = per("prompt") ?: return@forEach
+                KnownModels.live[id] = Price(pin, per("completion") ?: 0.0, per("input_cache_read"))
+            }
             arr.mapNotNull { (it as? JsonObject)?.get("id")?.jsonPrimitive?.content?.removePrefix("models/") }.sorted()
         } finally { c.disconnect() }
     }

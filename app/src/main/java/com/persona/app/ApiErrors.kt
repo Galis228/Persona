@@ -37,7 +37,7 @@ object ApiErrors {
                 "В настройках приватности OpenRouter запрещены бесплатные модели. Открой настройки и разреши их — или выбери платную модель.",
                 ErrKind.PRIVACY, "https://openrouter.ai/settings/privacy")
             code == 404 || low.contains("model_not_found") || low.contains("not a valid model") -> EngineException(
-                "Модель «${model.ifBlank { "?" }}» не найдена у ${p.title}. Выбери другую в «Настройки → API-ключ».",
+                "Модель «${model.ifBlank { "?" }}» не найдена у ${p.title}. Выбери другую в «Настройки → Через интернет».",
                 ErrKind.MODEL)
             code == 403 -> EngineException("${p.title} недоступен из твоего региона или для этого ключа. $msg".trim(), ErrKind.KEY)
             code in 500..599 -> EngineException("У ${p.title} сбой на сервере ($code). Попробуй ещё раз чуть позже.", ErrKind.RATE)

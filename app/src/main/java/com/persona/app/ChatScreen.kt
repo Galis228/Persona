@@ -459,7 +459,7 @@ private fun ChatsDialog(c: Character, current: String, onOpen: (String) -> Unit,
 private fun MemoryBar(chat: Chat, c: Character, s: Settings, local: Boolean) {
     val books by LocalContext.current.app.repo.books.collectAsStateWithLifecycle()
     var info by remember { mutableStateOf(false) }
-    val total = if (local) s.contextTokens else 24000
+    val total = if (local) s.contextTokens else s.apiContext
     val used = remember(chat.messages.size, chat.summary, chat.facts.size, local, s.contextTokens) {
         val st = s.forChat(chat)
         val sys = Prompt.system(c, chat, st, books, chat.messages.takeLast(6).joinToString("\n") { it.text })
